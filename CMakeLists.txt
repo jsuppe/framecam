@@ -16,20 +16,25 @@ include(FetchContent)
 # --- framelink ----------------------------------------------------------------
 # The camera OWNS a framelink channel; producers attach and render into the
 # buffers it hands out. Sibling checkout by default.
-set(FRAMELINK_DIR "${CMAKE_SOURCE_DIR}/../framelink" CACHE PATH
-    "Path to the framelink checkout")
-if(NOT EXISTS "${FRAMELINK_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR
-        "framelink not found at '${FRAMELINK_DIR}'. Clone it beside framecam "
-        "or pass -DFRAMELINK_DIR=<path>.")
+# A parent project may already have added framelink (vkrender composes both),
+# so only add it if nobody has. Adding the same source directory twice is a
+# hard CMake error, which is what building framecam inside vkrender hit.
+if(NOT TARGET framelink)
+    set(FRAMELINK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../framelink" CACHE PATH
+        "Path to the framelink checkout")
+    if(NOT EXISTS "${FRAMELINK_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "framelink not found at '${FRAMELINK_DIR}'. Clone it beside framecam "
+            "or pass -DFRAMELINK_DIR=<path>.")
+    endif()
+    set(FRAMELINK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${FRAMELINK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/framelink")
 endif()
-set(FRAMELINK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory("${FRAMELINK_DIR}" "${CMAKE_BINARY_DIR}/framelink")
 
 # --- softcam (vendored, MIT) --------------------------------------------------
 # DirectShow filter + sender API in one DLL. Register once, elevated:
 #   regsvr32 softcam.dll
-set(SC ${CMAKE_SOURCE_DIR}/third_party/softcam/src)
+set(SC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/softcam/src)
 file(GLOB SC_BASECLASSES ${SC}/baseclasses/*.cpp)
 add_library(softcam SHARED
     ${SC_BASECLASSES}
@@ -62,14 +67,14 @@ set(WIL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WIL_BUILD_PACKAGING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(wil)
 
-set(VCS ${CMAKE_SOURCE_DIR}/third_party/VCamSample/VCamSampleSource)
+set(VCS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/VCamSample/VCamSampleSource)
 add_library(vkrender_vcam_source SHARED
     ${VCS}/Activator.cpp ${VCS}/EnumNames.cpp ${VCS}/FrameGenerator.cpp
     ${VCS}/MFTools.cpp ${VCS}/MediaSource.cpp ${VCS}/MediaStream.cpp
     ${VCS}/Tools.cpp ${VCS}/WinTrace.cpp ${VCS}/dllmain.cpp ${VCS}/pch.cpp
     ${VCS}/VCamSampleSource.def)
 target_include_directories(vkrender_vcam_source PRIVATE
-    ${VCS} ${wil_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    ${VCS} ${wil_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(vkrender_vcam_source PRIVATE UNICODE _UNICODE)
 target_compile_options(vkrender_vcam_source PRIVATE /EHsc /w /await:strict)
 target_link_libraries(vkrender_vcam_source PRIVATE
@@ -78,7 +83,7 @@ target_link_libraries(vkrender_vcam_source PRIVATE
 
 # --- the camera itself --------------------------------------------------------
 add_executable(framecam src/framecam_win.cpp)
-target_include_directories(framecam PRIVATE ${SC}/softcam ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(framecam PRIVATE ${SC}/softcam ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(framecam PRIVATE framelink softcam d3d11 dxgi
     mfplat mfuuid mfsensorgroup)
 target_compile_options(framecam PRIVATE /EHsc)
