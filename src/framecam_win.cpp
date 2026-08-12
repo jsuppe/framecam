@@ -10,6 +10,12 @@
 //   framecam --mf [...]                         Media Foundation camera
 //   framecam --unregister                       remove the MF camera (elevated)
 //
+//   --idle-title "text"   show an animated standby card when no producer is
+//   --idle-code  "1234"   feeding frames: title, an optional BIG join code,
+//   --idle-hint  "text"   and an optional hint line. Without these the camera
+//                         behaves as before (holds the last frame). See
+//                         idle_card.h for why dead air is worth replacing.
+//
 // Default tier is the softcam DirectShow filter: Chrome, OBS, Zoom, classic
 // Teams. --mf uses MFCreateVirtualCamera instead, which Windows bridges into
 // DirectShow too - so one registration covers MF/UWP apps *and* DirectShow
@@ -38,8 +44,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
+#include "idle_card.h"
 #include "softcam.h"
 #include "vcam_shared.h"
 #include "framelink.h"
@@ -110,10 +118,19 @@ static int unregisterVirtualCamera() {
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
+static std::wstring widen(const char* s) {
+    if (!s || !*s) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    std::wstring w((size_t)(n > 0 ? n - 1 : 0), L'x');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+    return w;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool mfMode = false;
-    // strip --mf / --unregister from argv
+    std::wstring idleTitle, idleCode, idleHint;
+    // strip flags from argv; the rest stay positional
     int argn = 1;
     const char* args[8] = {};
     for (int i = 1; i < argc && argn < 8; ++i) {
@@ -121,6 +138,12 @@ int main(int argc, char** argv) {
             mfMode = true;
         } else if (strcmp(argv[i], "--unregister") == 0) {
             return unregisterVirtualCamera();
+        } else if (strcmp(argv[i], "--idle-title") == 0 && i + 1 < argc) {
+            idleTitle = widen(argv[++i]);
+        } else if (strcmp(argv[i], "--idle-code") == 0 && i + 1 < argc) {
+            idleCode = widen(argv[++i]);
+        } else if (strcmp(argv[i], "--idle-hint") == 0 && i + 1 < argc) {
+            idleHint = widen(argv[++i]);
         } else {
             args[argn++] = argv[i];
         }
@@ -211,60 +234,83 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> bgr((size_t)w * h * 3);
     uint64_t frames = 0, lastLog = 0;
 
+    // One send path for both camera tiers, fed by either the renderer's frame
+    // or the idle card - the camera cannot tell the difference, which is the
+    // point.
+    auto openMfTransport = [&]() {
+        if (!mfMode || shmView) return;
+        if (!shm) shm = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, VKR_VCAM_SHM);
+        if (shm && !shmMutex) shmMutex = OpenMutexW(SYNCHRONIZE, FALSE, VKR_VCAM_MUTEX);
+        if (shm && shmMutex) {
+            shmView = MapViewOfFile(shm, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+            if (shmView) printf("vcam: transport open - an app opened the camera\n");
+        }
+    };
+    auto sendBgra = [&](const unsigned char* src, size_t stride) {
+        if (mfMode) {
+            if (shmView && WaitForSingleObject(shmMutex, 10) == WAIT_OBJECT_0) {
+                auto* hd = (vkr::VcamHeader*)shmView;
+                unsigned char* px = (unsigned char*)shmView + sizeof(vkr::VcamHeader);
+                for (unsigned y = 0; y < h; ++y)
+                    memcpy(px + (size_t)y * w * 4, src + y * stride, (size_t)w * 4);
+                hd->width = w;
+                hd->height = h;
+                hd->frameCounter++;
+                ReleaseMutex(shmMutex);
+                ++frames;
+            }
+        } else {
+            // BGRA -> tight 24-bit BGR (softcam's shared-memory format).
+            for (unsigned y = 0; y < h; ++y) {
+                const unsigned char* s = src + y * stride;
+                unsigned char* dst = bgr.data() + (size_t)y * w * 3;
+                for (unsigned x = 0; x < w; ++x) {
+                    dst[x * 3 + 0] = s[x * 4 + 0];
+                    dst[x * 3 + 1] = s[x * 4 + 1];
+                    dst[x * 3 + 2] = s[x * 4 + 2];
+                }
+            }
+            scSendFrame(cam, bgr.data());
+            ++frames;
+        }
+    };
+
+    // The idle card, if asked for. With it enabled the acquire timeout drops
+    // to one frame period so standby animates at ~30fps; without it the old
+    // behaviour (hold the last frame) is untouched.
+    vkr::IdleCard card;
+    const bool idleEnabled = !idleTitle.empty() || !idleCode.empty();
+    if (idleEnabled && !card.init(w, h, idleTitle, idleCode, idleHint))
+        fprintf(stderr, "vcam: idle card init failed - continuing without it\n");
+    const ULONGLONG t0 = GetTickCount64();
+    const uint32_t acquireMs = idleEnabled ? 33 : 2000;
+
     for (;;) {
         flFrame frame{};
-        flResult r = flAcquireFrame(c, &frame, 2000);
+        flResult r = flAcquireFrame(c, &frame, acquireMs);
         // Neither an idle renderer nor a departed one is fatal now: we own the
         // channel, so the camera stays up and the renderer can reattach. Before
         // the port a disconnect ended the process and took the camera with it.
-        if (r == FL_TIMEOUT || r == FL_DISCONNECTED) continue;
+        if (r == FL_TIMEOUT || r == FL_DISCONNECTED) {
+            if (idleEnabled) {
+                openMfTransport();
+                const double t = (double)(GetTickCount64() - t0) / 1000.0;
+                sendBgra(card.render(t), (size_t)w * 4);
+            }
+            continue;
+        }
         if (r != FL_OK) {
             fprintf(stderr, "vcam: flAcquireFrame -> %s\n", flResultString(r));
             break;
         }
         // MF mode: the transport appears once a camera app opens the stream
         // (the media source creates it in the frame server).
-        if (mfMode && !shmView) {
-            if (!shm) shm = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, VKR_VCAM_SHM);
-            if (shm && !shmMutex) shmMutex = OpenMutexW(SYNCHRONIZE, FALSE, VKR_VCAM_MUTEX);
-            if (shm && shmMutex) {
-                shmView = MapViewOfFile(shm, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-                if (shmView) printf("vcam: transport open - an app opened the camera\n");
-            }
-        }
+        openMfTransport();
 
         ctx->CopyResource(staging.Get(), flImageD3D11(frame.image));
         D3D11_MAPPED_SUBRESOURCE map;
         if (SUCCEEDED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) {
-            if (mfMode) {
-                if (shmView && WaitForSingleObject(shmMutex, 10) == WAIT_OBJECT_0) {
-                    auto* hd = (vkr::VcamHeader*)shmView;
-                    unsigned char* px = (unsigned char*)shmView + sizeof(vkr::VcamHeader);
-                    for (unsigned y = 0; y < h; ++y)
-                        memcpy(px + (size_t)y * w * 4,
-                               (const unsigned char*)map.pData + y * map.RowPitch,
-                               (size_t)w * 4);
-                    hd->width = w;
-                    hd->height = h;
-                    hd->frameCounter++;
-                    ReleaseMutex(shmMutex);
-                    ++frames;
-                }
-            } else {
-                // BGRA -> tight 24-bit BGR (softcam's shared-memory format).
-                for (unsigned y = 0; y < h; ++y) {
-                    const unsigned char* src =
-                        (const unsigned char*)map.pData + y * map.RowPitch;
-                    unsigned char* dst = bgr.data() + (size_t)y * w * 3;
-                    for (unsigned x = 0; x < w; ++x) {
-                        dst[x * 3 + 0] = src[x * 4 + 0];
-                        dst[x * 3 + 1] = src[x * 4 + 1];
-                        dst[x * 3 + 2] = src[x * 4 + 2];
-                    }
-                }
-                scSendFrame(cam, bgr.data());
-                ++frames;
-            }
+            sendBgra((const unsigned char*)map.pData, map.RowPitch);
             ctx->Unmap(staging.Get(), 0);
         }
         flRelease(c, &frame);

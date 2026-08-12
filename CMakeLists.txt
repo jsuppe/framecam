@@ -29,6 +29,17 @@ if(NOT TARGET framelink)
     endif()
     set(FRAMELINK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     add_subdirectory("${FRAMELINK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/framelink")
+    # Co-locate framelink.dll beside framecam.exe. Without this the DLL lands
+    # in the subproject's own directory, and whatever framelink.dll happens to
+    # sit beside the exe - including a stale one from an earlier era - wins the
+    # loader search. That is not hypothetical: a leftover v1 DLL shadowed a v3
+    # build here, and only the version handshake's refusal made it visible.
+    if(WIN32 AND TARGET framelink)
+        set_target_properties(framelink PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_BINARY_DIR}/Debug"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo")
+    endif()
 endif()
 
 # --- softcam (vendored, MIT) --------------------------------------------------
