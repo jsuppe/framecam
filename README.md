@@ -66,6 +66,12 @@ cmake -S . -B build          # expects ../framelink, or -DFRAMELINK_DIR=<path>
 cmake --build build --config Release
 ```
 
+framecam is not pinned to a framelink revision. Build it against the revision the
+renderer feeding it uses: framelink refuses a peer with a different `FL_VERSION`.
+For vkrender that is the pin in vkrender's `.github/workflows/build.yml`
+(currently `c6d7db7`, `FL_VERSION` 6). vkrender also builds framecam itself when a
+framecam checkout sits beside it, which is how its appliance installer gets it.
+
 ## Names you must not change casually
 
 The MF source DLL name, its CLSID, and the shared-memory names in
@@ -75,8 +81,9 @@ breaks every installed camera until someone re-registers with elevation.
 
 ## Status
 
-Windows only. `vcam_linux.cpp` over **v4l2loopback** is next and needs
-framelink's dma-buf backend first.
+Windows only. `vcam_linux.cpp` over **v4l2loopback** is the planned next backend;
+framelink's Linux dma-buf backend it was waiting for now exists, but no work has
+started.
 
 MIT. Vendors [softcam](third_party/softcam) (MIT) and
 [VCamSample](third_party/VCamSample) (MIT); both keep their own LICENSE files.
